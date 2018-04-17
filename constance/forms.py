@@ -6,8 +6,9 @@ import os
 from django import forms
 from django.conf import settings as django_settings
 from django.contrib.admin import widgets
-from django.core.exceptions import ImproperlyConfigured
-from django.forms import fields
+from django.core.exceptions import FieldError, ImproperlyConfigured
+from django.forms import ALL_FIELDS, fields
+from django.forms.forms import DeclarativeFieldsMetaclass
 from django.utils import six
 from django.utils.encoding import smart_bytes
 from django.utils.module_loading import import_string
@@ -76,14 +77,62 @@ if not six.PY3:
     })
 
 
-class ConstanceForm(forms.Form):
+class ConstanceOptions(object):
+    def __init__(self, options=None):
+        self.fields = getattr(options, 'fields', None)
+        self.exclude = getattr(options, 'exclude', None)
+
+
+class ConstanceMetaclass(DeclarativeFieldsMetaclass):
+    def __new__(mcs, name, bases, attrs):
+        new_class = super(ConstanceMetaclass, mcs).__new__(mcs, name, bases, attrs)
+
+        opts = new_class._meta = ConstanceOptions(getattr(new_class, 'Meta', None))
+        # We check if a string was passed to `fields` or `exclude`,
+        # which is likely to be a mistake where the user typed ('foo') instead
+        # of ('foo',)
+        for opt in ['fields', 'exclude']:
+            value = getattr(opts, opt)
+            if isinstance(value, six.string_types) and value != ALL_FIELDS:
+                msg = ("%(model)s.Meta.%(opt)s cannot be a string. "
+                       "Did you mean to type: ('%(value)s',)?" % {
+                           'model': new_class.__name__,
+                           'opt': opt,
+                           'value': value,
+                       })
+
+                raise TypeError(msg)
+
+        base_fields = dict()
+
+        if opts.fields is not None and opts.fields != ALL_FIELDS:
+            for field in opts.fields:
+                if field in settings.CONFIG.keys():
+                    base_fields[field] = None
+                else:
+                    message = "Unknown field '%s' specified for %s"
+                    message = message % (field, new_class.__name__)
+                    raise FieldError(message)
+
+        else:
+            base_fields = settings.CONFIG
+
+        new_class.base_fields = base_fields
+
+        return new_class
+
+
+class BaseConstanceForm(forms.Form):
     version = forms.CharField(widget=forms.HiddenInput)
 
     def __init__(self, initial, *args, **kwargs):
-        super(ConstanceForm, self).__init__(*args, initial=initial, **kwargs)
+        super(BaseConstanceForm, self).__init__(*args, initial=initial, **kwargs)
         version_hash = hashlib.md5()
 
         for name, options in settings.CONFIG.items():
+            if name not in self.base_fields:
+                continue
+
             default = options[0]
             if len(options) == 3:
                 config_type = options[2]
@@ -136,7 +185,7 @@ class ConstanceForm(forms.Form):
         return value
 
     def clean(self):
-        cleaned_data = super(ConstanceForm, self).clean()
+        cleaned_data = super(BaseConstanceForm, self).clean()
 
         if not settings.CONFIG_FIELDSETS:
             return cleaned_data
@@ -150,3 +199,7 @@ class ConstanceForm(forms.Form):
                                           'field(s) that exists in CONSTANCE_CONFIG.'))
 
         return cleaned_data
+
+
+class ConstanceForm(six.with_metaclass(ConstanceMetaclass, BaseConstanceForm)):
+    pass
